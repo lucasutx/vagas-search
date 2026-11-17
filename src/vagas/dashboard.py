@@ -348,7 +348,7 @@ class Data:
 
 # ---------- tarefas (comandos disparados pelo painel) ----------
 LOGS = DATA_DIR / "logs"
-BROWSER_TASKS = {"search", "prepare", "apply", "run", "resume", "linkedin"}   # usam o perfil do navegador: um por vez
+BROWSER_TASKS = {"search", "prepare", "apply", "run", "resume", "linkedin", "login"}   # usam o perfil do navegador: um por vez
 
 
 WINDOWS = os.name == "nt"
@@ -431,6 +431,9 @@ def start_task(kind: str, args: dict, ignore_busy: tuple = ()) -> dict:
         if args.get("resume_run"): cmd += ["--religar"]
         if args.get("auto"): cmd += ["--auto"]
         if args.get("batch_file"): cmd += ["--lote", str(args["batch_file"])]
+    elif kind == "login":
+        cmd = base + ["entrar", "--url", str(args["url"]), "--site", str(args.get("site") or "")]
+        if args.get("resume_run"): cmd += ["--religar"]
     else:
         raise RuntimeError("comando desconhecido")
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -457,6 +460,271 @@ def start_task(kind: str, args: dict, ignore_busy: tuple = ()) -> dict:
 
 
 STOP_HARD_AFTER = 150   # s: o processo tem 90 s de graça (apply/run) para terminar a vaga atual; depois disso, força
+
+
+# ---------- tela Contas: login nas plataformas ----------
+PLATFORMS = [
+    {"id": "linkedin", "name": "LinkedIn", "url": "https://www.linkedin.com/login",
+     "what": "Candidatura simplificada e o botão \"Entrar com LinkedIn\" que o bot usa na Gupy."},
+    {"id": "indeed", "name": "Indeed", "url": "https://secure.indeed.com/auth?hl=pt_BR&co=BR",
+     "what": "Indeed Apply. Quando a sessão cai, o Indeed pede verificação e o bot pausa as vagas dele por 3 h."},
+    {"id": "gupy", "name": "Gupy", "url": "https://login.gupy.io/candidates/signin",
+     "what": "O bot entra pelo LinkedIn a cada vaga; logar aqui só é preciso para ver suas candidaturas."},
+    {"id": "recrutei", "name": "Recrutei", "url": "https://talent.recrutei.com.br/login",
+     "what": "Vagas da Recrutei usam o currículo do seu perfil de lá."},
+]
+JUNK_ACCOUNT_HOSTS = ("youtube.com", "linkedin.com")   # "pede conta" que não é portal de vagas (vídeo, cadastro do LinkedIn)
+LOGIN_ISSUE_RE = "%login%"
+
+
+# ---------- Preferências (decisões do usuário editáveis no painel) ----------
+# Cada chave vira uma linha em config/preferencias.yaml, que vale por cima do settings.yaml (config.load_settings).
+# Valor igual ao do settings.yaml = a linha some (o arquivo guarda só o que você mudou).
+AGE_CHOICES = [24, 48, 72, 120, 168, 336, 720]
+SENIORITIES = ["junior", "mid", "senior", "lead", "unspecified"]
+
+
+def _hhmm(v) -> str:
+    v = str(v or "").strip()
+    if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", v):
+        raise ValueError(f"horário inválido: {v!r} (use HH:MM)")
+    h, m = v.split(":")
+    return f"{int(h):02d}:{m}"
+
+
+def _int_in(lo: int, hi: int):
+    def f(v):
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            raise ValueError(f"número inválido: {v!r}")
+        if not lo <= n <= hi:
+            raise ValueError(f"{n} fora do intervalo {lo}–{hi}")
+        return n
+    return f
+
+
+def _seniorities(v):
+    vals = [x for x in (v or []) if x in SENIORITIES]
+    if not vals:
+        raise ValueError("escolha pelo menos um nível")
+    return [x for x in SENIORITIES if x in vals]
+
+
+def _bool(v):
+    return bool(v) and v not in ("0", "false", "False")
+
+
+PREF_FIELDS = {
+    "discovery.max_age_hours": _int_in(1, 720),
+    "filters.allowed_seniorities": _seniorities,
+    "filters.accept_english": _bool,
+    "apply.min_fit_score": _int_in(0, 100),
+    "filters.unspecified_min_fit_score": _int_in(0, 100),
+    "limits.max_applications_per_day": _int_in(1, 1000),
+    "limits.max_per_source_per_day.linkedin": _int_in(0, 150),
+    "limits.active_hours": None,               # [início, fim]
+    "limits.discovery_interval_minutes": _int_in(15, 720),
+    "local": _bool,                            # presencial/híbrido na região (discovery.local_location)
+}
+
+
+def _base_raw() -> dict:
+    path = CONFIG_DIR / "settings.yaml"
+    if not path.exists():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def _dig(d: dict, key: str, default=None):
+    cur = d
+    for k in key.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def prefs_state(data) -> dict:
+    from .config import load_prefs
+    s = data.s
+    base = Settings.model_validate(_base_raw())
+    prefs = load_prefs()
+    cur = {
+        "discovery.max_age_hours": s.discovery.max_age_hours,
+        "filters.allowed_seniorities": list(s.filters.allowed_seniorities),
+        "filters.accept_english": s.filters.accept_english,
+        "apply.min_fit_score": s.apply.min_fit_score,
+        "filters.unspecified_min_fit_score": s.filters.unspecified_min_fit_score,
+        "limits.max_applications_per_day": s.limits.max_applications_per_day,
+        "limits.max_per_source_per_day.linkedin": s.limits.max_per_source_per_day.get("linkedin", 50),
+        "limits.active_hours": list(s.limits.active_hours),
+        "limits.discovery_interval_minutes": s.limits.discovery_interval_minutes,
+        "local": bool(s.discovery.local_location),
+    }
+    changed = [k for k in prefs if k in PREF_FIELDS]
+    if "discovery.local_location" in prefs:
+        changed.append("local")
+    return {
+        "values": cur, "changed": changed,
+        "local_area": base.discovery.local_location, "local_cities": base.discovery.local_cities,
+        "age_choices": AGE_CHOICES, "seniorities": SENIORITIES,
+        "searches_total": len(s.all_searches()),
+        "run_running": "run" in running_tasks(),
+        "age_skipped": data.db.conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='skipped' AND reason LIKE 'publicada há mais de %'").fetchone()[0],
+    }
+
+
+def save_prefs(data, changes: dict) -> dict:
+    """Valida e grava as escolhas. Não reinicia nada (quem chama decide)."""
+    from .config import PREFS_PATH, load_prefs, load_settings as _ls
+    base = Settings.model_validate(_base_raw())
+    prefs = load_prefs()
+    before = data.s.discovery.max_age_hours
+    for key, val in (changes or {}).items():
+        if key not in PREF_FIELDS:
+            raise ValueError(f"preferência desconhecida: {key}")
+        if key == "local":
+            if _bool(val) or not base.discovery.local_location:
+                prefs.pop("discovery.local_location", None)
+            else:
+                prefs["discovery.local_location"] = ""
+            continue
+        if key == "limits.active_hours":
+            a, b = (_hhmm(x) for x in (list(val or []) + ["", ""])[:2])
+            if a >= b:
+                raise ValueError("o horário de início tem de ser antes do fim")
+            val, base_val = [a, b], list(base.limits.active_hours)
+        elif key == "filters.accept_english":
+            val, base_val = _bool(val), base.filters.accept_english
+            langs = [x for x in base.filters.job_languages if x != "en"] + (["en"] if val else [])
+            if sorted(langs) == sorted(base.filters.job_languages):
+                prefs.pop("filters.job_languages", None)
+            else:
+                prefs["filters.job_languages"] = langs
+        else:
+            val = PREF_FIELDS[key](val)
+            base_val = _dig(base.model_dump(), key)
+            if key == "limits.max_per_source_per_day.linkedin" and base_val is None:
+                base_val = 50
+        if val == base_val:
+            prefs.pop(key, None)
+        else:
+            prefs[key] = val
+    if prefs:
+        head = ("# Escolhas feitas no painel (tela Preferências). Valem por cima do settings.yaml.\n"
+                "# Apague uma linha (ou o arquivo) para voltar ao valor do settings.yaml.\n")
+        PREFS_PATH.write_text(head + yaml.safe_dump(prefs, allow_unicode=True, sort_keys=True), encoding="utf-8")
+    elif PREFS_PATH.exists():
+        PREFS_PATH.unlink()
+    return {"ok": True, "age_before": before, "age_after": _ls().discovery.max_age_hours}
+
+
+def requeue_age_skipped(db, max_age: int) -> int:
+    """Janela aumentou: vagas puladas só por idade que cabem na nova janela voltam para 'new' e passam por todos os
+    filtros de novo (classification=NULL)."""
+    from .sources.base import is_too_old
+    rows = db.conn.execute("SELECT id, posted_at FROM jobs WHERE status='skipped' AND reason LIKE 'publicada há mais de %'").fetchall()
+    ids = [r[0] for r in rows if r[1] and not is_too_old(r[1], max_age)]
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        db.conn.execute(f"UPDATE jobs SET status='new', reason=NULL, classification=NULL WHERE id IN ({','.join('?' * len(part))})", part)
+    db.conn.commit()
+    return len(ids)
+
+
+def restart_run_later() -> bool:
+    """Reinicia a leva (parada graciosa: termina a vaga atual) para ela ler as preferências novas."""
+    import time
+    if "run" not in running_tasks():
+        return False
+
+    def work():
+        stop_task("run")
+        for _ in range(90):
+            if "run" not in running_tasks():
+                break
+            time.sleep(2)
+        try:
+            start_task("run", {})
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def accounts_state(data) -> dict:
+    c = data.db.conn
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    plats = []
+    for pl in PLATFORMS:
+        until = data.db.kv_get(f"source_block:{pl['id']}") or ""
+        issues = c.execute("SELECT COUNT(*), MAX(updated_at) FROM jobs WHERE source=? AND updated_at>=? AND "
+                           "(reason LIKE '%login%' OR reason LIKE '%verifica%' OR reason LIKE '%checkpoint%')",
+                           (pl["id"], (datetime.now() - timedelta(days=3)).isoformat(timespec="seconds"))).fetchone()
+        waiting = c.execute("SELECT COUNT(*) FROM jobs WHERE source=? AND status='queued'", (pl["id"],)).fetchone()[0]
+        plats.append(dict(pl, blocked_until=until if until > now_iso else "", issues=issues[0], last_issue=issues[1] or "",
+                          last_login=data.db.kv_get(f"login_at:{pl['id']}") or "", waiting=waiting))
+    sites = []
+    for key, url in c.execute("SELECT key, value FROM kv WHERE key LIKE 'needs_account:%' ORDER BY key").fetchall():
+        host = key.split(":", 1)[1]
+        if not url or any(j in host for j in JUNK_ACCOUNT_HOSTS):
+            continue
+        dom = host.lstrip("*.")
+        jobs = c.execute("SELECT COUNT(*) FROM jobs WHERE (external_url LIKE ? OR url LIKE ?) AND status IN "
+                         "('pending_question','failed','skipped','queued')", (f"%{dom}%", f"%{dom}%")).fetchone()[0]
+        sites.append({"host": host, "url": url, "jobs": jobs, "wildcard": host.startswith("*."),
+                      "last_login": data.db.kv_get(f"login_at:{host}") or ""})
+    sites.sort(key=lambda x: (-x["jobs"], x["host"]))
+    st = {}
+    try:
+        st = json.loads((LOGS / "login_state.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    run = running_tasks()
+    return {"platforms": plats, "sites": sites, "login": st, "login_running": "login" in run, "run_running": "run" in run}
+
+
+def login_browser(url: str, site: str) -> None:
+    """Botão Entrar da tela Contas: pausa a leva (parada graciosa), abre o Chrome comum do bot no login e, quando você
+    fecha a janela, a própria tarefa religa a leva (--religar) — não depende desta thread nem do painel continuar de pé."""
+    import time
+    if not re.match(r"^https?://", url or ""):
+        raise RuntimeError("link inválido")
+    if "login" in running_tasks():
+        raise RuntimeError("já existe uma janela de login aberta: feche-a primeiro")
+
+    def mark(state: str, msg: str):
+        (LOGS / "login_state.json").write_text(json.dumps({"site": site, "url": url, "state": state, "msg": msg,
+                                                           "at": datetime.now().isoformat(timespec="seconds")},
+                                                          ensure_ascii=False), encoding="utf-8")
+
+    def work():
+        was_running = "run" in running_tasks()
+        try:
+            if was_running:
+                mark("pausando", "pausando as candidaturas para liberar o navegador do bot (até 2 min)…")
+                stop_task("run")
+                for _ in range(90):
+                    if "run" not in running_tasks():
+                        break
+                    time.sleep(2)
+            busy = [k for k in running_tasks() if k in BROWSER_TASKS]
+            if busy:
+                raise RuntimeError(f"navegador ocupado por: {', '.join(busy)}")
+            start_task("login", {"url": url, "site": site, "resume_run": was_running})
+        except Exception as e:
+            mark("erro", str(e)[:200])
+            if was_running and "run" not in running_tasks():
+                try:
+                    start_task("run", {})
+                except Exception:
+                    pass
+
+    LOGS.mkdir(parents=True, exist_ok=True)
+    mark("pausando" if "run" in running_tasks() else "abrindo", "preparando o navegador do bot…")
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ---------- tela LinkedIn ----------
@@ -790,6 +1058,8 @@ def serve(settings: Settings, port: int = 8765) -> None:
                 if u.path in ("/", "/index.html"): return self._file(STATIC / "index.html", "text/html; charset=utf-8")
                 if u.path == "/api/overview": return self._json(data.overview())
                 if u.path == "/api/counts": return self._json(data.counts())
+                if u.path == "/api/accounts": return self._json(accounts_state(data))
+                if u.path == "/api/prefs": return self._json(prefs_state(data))
                 if u.path == "/api/linkedin": return self._json(linkedin_state(data))
                 if u.path == "/api/linkedin/status":
                     from . import linkedin_profile as lp
@@ -891,6 +1161,27 @@ def serve(settings: Settings, port: int = 8765) -> None:
                     return self._json({"ok": True, "result": res} if res == "enviado" else {"error": res}, 200 if res == "enviado" else 400)
                 if u.path == "/api/pending/resolved":
                     data.resolve_pending(int(payload["id"])); return self._json({"ok": True})
+                if u.path == "/api/accounts/login":
+                    site = str(payload.get("site") or "")
+                    pl = next((x for x in PLATFORMS if x["id"] == site), None)
+                    url = pl["url"] if pl else data.db.kv_get(f"needs_account:{site}") or ""
+                    try:
+                        login_browser(url, site); return self._json({"ok": True})
+                    except RuntimeError as e:
+                        return self._json({"error": str(e)}, 409)
+                if u.path == "/api/prefs":
+                    try:
+                        res = save_prefs(data, payload.get("changes") or {})
+                    except ValueError as e:
+                        return self._json({"error": str(e)}, 400)
+                    if res["age_after"] > res["age_before"]:
+                        res["requeued"] = requeue_age_skipped(data.db, res["age_after"])
+                    res["restarted"] = restart_run_later()
+                    return self._json(res)
+                if u.path == "/api/accounts/forget":
+                    host = str(payload.get("host") or "")
+                    data.db.conn.execute("DELETE FROM kv WHERE key=?", (f"needs_account:{host}",)); data.db.conn.commit()
+                    return self._json({"ok": True})
                 if u.path == "/api/open":
                     try:
                         open_in_bot_browser(str(payload.get("url") or "")); return self._json({"ok": True})

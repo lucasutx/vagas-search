@@ -117,6 +117,56 @@ def _host_blacklisted(url: str, lista) -> str:
     return ""
 
 
+CAPTCHA_GATE_JS = r"""() => {
+  const vis = f => { const r = f.getBoundingClientRect(); return r.width > 100 && r.height > 40; };
+  // "Não sou um robô" de verdade (caixinha): reCAPTCHA size=normal, Turnstile ou hCaptcha visíveis. O selo invisível
+  // do reCAPTCHA (size=invisible, canto da tela) não trava nada e não conta.
+  const widget = [...document.querySelectorAll('iframe')].some(f => vis(f) &&
+      /recaptcha\/(enterprise|api2)\/anchor[^"]*size=normal|challenges\.cloudflare\.com|hcaptcha\.com/i.test(f.src || ''));
+  const t = document.querySelector('textarea[name="g-recaptcha-response"], input[name="cf-turnstile-response"], textarea[name="h-captcha-response"], input[name="h-captcha-response"]');
+  const solved = !!(t && (t.value || '').length > 20);
+  const submit = [...document.querySelectorAll('button')].find(b =>
+      /enviar|submit|finalizar|concluir/i.test((b.innerText || '') + ' ' + (b.getAttribute('name') || '')));
+  return {widget, solved, submitDisabled: !!(submit && (submit.disabled || submit.getAttribute('aria-disabled') === 'true'))};
+}"""
+
+
+def _captcha_gate(scope) -> dict:
+    try:
+        return scope.evaluate(CAPTCHA_GATE_JS) or {}
+    except Exception:
+        return {}
+
+
+def _wait_final_captcha(ctx: ApplyContext, page, scope, job: Job) -> bool:
+    """O envio final pede "Não sou um robô" (Indeed: reCAPTCHA logo acima de "Enviar sua candidatura", que fica
+    desabilitado até alguém marcar). O robô NUNCA resolve captcha: avisa (Telegram) e espera VOCÊ marcar na janela
+    do navegador do bot. Antes disso o fluxo morria com "não achei botão de avançar/enviar" com tudo preenchido —
+    9 capturas iguais em data/learn/indeed. True = liberado (o laço segue e clica em enviar)."""
+    from .. import stopflag
+    minutes = float(getattr(ctx.settings.limits, "final_captcha_wait_minutes", 4) or 0)
+    if minutes <= 0:
+        return False
+    console.print(f"[bold yellow]  🧩 falta só marcar 'Não sou um robô' para enviar; esperando você até {minutes:.0f} min na janela do navegador do bot[/]")
+    try:
+        from ..notify import notify as _notify
+        _notify(f"🧩 Falta só marcar \"Não sou um robô\" para ENVIAR: {job.title} — {job.company}. "
+                f"Abra a janela do navegador do bot e marque a caixinha (espero {minutes:.0f} min).")
+    except Exception:
+        pass
+    end = time.time() + minutes * 60
+    while time.time() < end:
+        if stopflag.requested():
+            return False
+        time.sleep(3)
+        g = _captcha_gate(scope)
+        if g.get("solved") or (g and not g.get("submitDisabled")):
+            console.print("[green]  ✔ captcha marcado; enviando[/]")
+            time.sleep(1.5)
+            return True
+    return False
+
+
 def run_form_flow(ctx: ApplyContext, page: Page, job: Job, *, ats: str, root_selector: str | None = None,
                   pre_step: Callable[[Page, int], None] | None = None, max_steps: int | None = None) -> FlowResult:
     max_steps = max_steps or ctx.settings.limits.max_form_steps
@@ -264,6 +314,17 @@ def run_form_flow(ctx: ApplyContext, page: Page, job: Job, *, ats: str, root_sel
             except Exception:
                 pass
         btn = forms.find_action_button(scope, root_for_scope, include_disabled=True)
+        if (not btn or btn[1].startswith("disabled:")) and not ctx.dry_run:
+            g = _captcha_gate(scope if scope is not page else page)
+            if g.get("widget") and not g.get("solved") and g.get("submitDisabled"):
+                if _wait_final_captcha(ctx, page, scope, job):
+                    continue
+                try:
+                    ctx.db.add_pending_question(job.id, f"Falta marcar \"Não sou um robô\" e clicar em Enviar no Indeed (o resto já foi preenchido): {job.url}", "link", [], "")
+                except Exception:
+                    pass
+                forms.dump_learn(page, job.id, ats, fields, "captcha no envio final (ninguém marcou)", step)
+                return FlowResult("needs_user", "falta marcar 'Não sou um robô' no envio final (pendência com o link)", step, answers_log)
         if btn and btn[1].startswith("disabled:"):
             # botão existe mas está desabilitado: falta algo obrigatório (ex.: cidade não escolhida na lista)
             error_rounds += 1

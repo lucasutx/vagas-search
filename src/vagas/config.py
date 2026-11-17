@@ -14,7 +14,9 @@ from pydantic import BaseModel, Field, model_validator
 # `discovery.local_cities` (pedido do usuário em 2026-10-29: aceita BH e região; teto de idade 24h -> 72h
 # para ter mais volume). Valem para toda busca e toda vaga, independentemente do settings.yaml.
 # ============================================================
-HARD_MAX_AGE_HOURS = 72
+# Desde 2026-11-17 a janela é escolha do usuário na tela Preferências (24h, 72h, 1 semana...): isto é só o TETO
+# de segurança. O valor em uso é discovery.max_age_hours (settings.yaml + config/preferencias.yaml).
+HARD_MAX_AGE_HOURS = 720
 HARD_REMOTE_ONLY = True
 AIRLINE_MAX_AGE_HOURS = 720   # teto da trilha de companhia aérea (vagas raras): 30 dias
 
@@ -68,7 +70,7 @@ class Discovery(BaseModel):
     stack_queries_sources: list[str] = Field(default_factory=lambda: ["linkedin"])
     seniority_terms: list[str] = Field(default_factory=list)
     max_pages_per_search: int = 3
-    max_age_hours: int = HARD_MAX_AGE_HOURS
+    max_age_hours: int = 72
     # presencial/híbrido aceitos só nestas cidades; as buscas locais usam local_location sem filtro de remoto
     local_location: str = ""
     local_cities: list[str] = Field(default_factory=list)
@@ -142,6 +144,8 @@ class Limits(BaseModel):
     active_hours: tuple[str, str] = ("08:00", "23:30")
     discovery_interval_minutes: int = 120
     inbox_interval_minutes: int = 30   # leitura do Gmail (retornos) enquanto o bot roda, inclusive fora da janela ativa
+    # envio final com "Não sou um robô" (Indeed): avisa no Telegram e espera VOCÊ marcar; 0 = vira pendência na hora
+    final_captcha_wait_minutes: float = 4.0
     # Indeed barrou o robô (Cloudflare/login): pausa as vagas do Indeed por N horas, sem gastar tentativa
     indeed_block_hours: float = 3.0
     max_form_steps: int = 12
@@ -311,6 +315,32 @@ class Settings(BaseModel):
         return DATA_DIR / "vagas.db"
 
 
+PREFS_PATH = CONFIG_DIR / "preferencias.yaml"
+
+
+def load_prefs() -> dict[str, Any]:
+    """Escolhas da tela Preferências do painel: {"discovery.max_age_hours": 168, ...} (chaves com ponto)."""
+    try:
+        d = yaml.safe_load(PREFS_PATH.read_text(encoding="utf-8")) or {}
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+
+
+def merge_prefs(raw: dict[str, Any], prefs: dict[str, Any]) -> dict[str, Any]:
+    import copy
+    out = copy.deepcopy(raw)
+    for key, val in prefs.items():
+        cur = out
+        parts = str(key).split(".")
+        for k in parts[:-1]:
+            if not isinstance(cur.get(k), dict):
+                cur[k] = {}
+            cur = cur[k]
+        cur[parts[-1]] = val
+    return out
+
+
 def load_settings(path: Path | None = None) -> Settings:
     path = path or CONFIG_DIR / "settings.yaml"
     example = CONFIG_DIR / "settings.example.yaml"
@@ -320,6 +350,8 @@ def load_settings(path: Path | None = None) -> Settings:
     raw: dict[str, Any] = {}
     if path.exists():
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if path.parent == CONFIG_DIR:   # escolhas feitas no painel (tela Preferências) valem por cima do settings.yaml
+        raw = merge_prefs(raw, load_prefs())
     s = Settings.model_validate(raw)
     # overrides por env
     if os.environ.get("VAGAS_LLM_CHEAP_MODEL"):

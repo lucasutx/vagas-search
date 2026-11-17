@@ -213,16 +213,40 @@ def fit_cultural(db, browser, profile: dict, log=console.print) -> int:
                 res = fitcultural.fill_test(page, log, kind=kind)
         except Exception as ex:
             res = f"failed: {type(ex).__name__}: {str(ex)[:120]}"
-        done = res in ("done", "already", "gone")
-        state = {"done": "respondido pelo bot com o seu gabarito", "already": "a Gupy já mostra o teste respondido",
+        verified = None
+        if res == "done":
+            # só conta como concluído de verdade depois de a página da candidatura mostrar a etapa com ✅
+            try:
+                verified = fitcultural.verify_done(page, r["action_url"], profile, browser, log, kind)
+            except Exception as ex:
+                log(f"[yellow]etapas: conferência falhou: {str(ex)[:80]}[/]")
+            if verified is not True:
+                res = "unverified"
+        elif res == "already":
+            verified = True   # a própria página da candidatura mostrou o ✅
+        done = res in ("done", "already", "gone", "unverified")
+        waiting = " · aguardando as próximas etapas"
+        state = {"done": "respondido pelo bot e conferido ✅ na Gupy" + waiting,
+                 "already": "a Gupy já mostra o teste respondido ✅" + waiting,
+                 "unverified": "respondido pelo bot até o Finalizar, mas a Gupy ainda não mostra ✅ — confira pelo link",
                  "gone": "candidatura encerrada (o link leva para a página de vagas)"}.get(res, res[8:])
         db.conn.execute("UPDATE email_responses SET auto_state=?, done=? WHERE id=?", (state[:200], 1 if done else 0, r["id"]))
         db.conn.commit()
         log(f"[cyan]etapas:[/] {label} {r['company']}: {state}")
         b = _bot()
         if b:
-            if done:
-                b.send(f"🧭 <b>{_e(label)}</b> — {_e(r['company'])}: {_e(state)}.")
+            jt = db.conn.execute("SELECT title FROM jobs WHERE id=?", (r["job_id"],)).fetchone() if r["job_id"] else None
+            title = f"{_e(label)}</b> — {_e(r['company'])}" + (f" · <i>{_e((jt[0] or '')[:60])}</i>" if jt and jt[0] else "")
+            if res in ("done", "already"):
+                b.send(f"✅ <b>{title}\n"
+                       + ("Respondi o teste com o seu gabarito e conferi na página da candidatura: a etapa está concluída ✅.\n"
+                          if res == "done" else "A página da candidatura já mostra a etapa concluída ✅.\n")
+                       + "Marquei no Retornos como feito — aguardando as próximas etapas.")
+            elif res == "unverified":
+                b.send(f"⚠️ <b>{title}\nRespondi as questões até o Finalizar, mas a página da candidatura ainda não mostra a etapa "
+                       "com ✅. Abra o link e confira:\n" + fmt_step(dict(r)))
+            elif res == "gone":
+                b.send(f"🧭 <b>{title}: {_e(state)}.")
             else:
                 b.send(f"⚠️ <b>{_e(label)}</b> — {_e(r['company'])}: não consegui responder sozinho ({_e(state)}).\n"
                        + fmt_step(dict(r)), buttons=_done_btn(dict(r)))

@@ -25,6 +25,9 @@ console = Console()
 KEY_PATH = DATA_DIR / "fitcultural" / "gupy.json"
 DONE_RE = re.compile(r"teste finalizado|respondeu 100%|j[aá] (respondeu|realizou|concluiu)|teste conclu[ií]do|obrigad[oa] por responder", re.I)
 START_RE = re.compile(r"^(iniciar|come[cç]ar|continuar|retomar)( (o )?teste| a responder| agora)?$|^vamos (l[aá]|come[cç]ar)$", re.I)
+# teste já feito noutra candidatura: a Gupy pergunta se reaproveita o resultado (Globalweb, 14/11). Vem ANTES do DONE_RE,
+# que casa "já respondeu" e deixaria a candidatura sem resultado
+REUSE_RE = re.compile(r"deseja utilizar os resultados|quer utilizar os resultados|utilizar (os )?resultados anteriores", re.I)
 NEXT_RE = re.compile(r"^(pr[oó]ximo passo|pr[oó]xim[oa]|avan[cç]ar|finalizar|concluir)$", re.I)
 
 # frase nova (a Gupy mudou o texto): dimensão pelas palavras
@@ -296,6 +299,27 @@ def _dump(page, tag: str) -> None:
         pass
 
 
+def _reuse(page, log, label: str) -> bool:
+    """Clica "Sim, quero utilizar" e espera a tela de reaproveitar sumir."""
+    btn = page.locator("#reuseTestButton")
+    try:
+        if btn.count():
+            btn.first.click(timeout=8000)
+        elif not _click_text(page, re.compile(r"^sim,? quero utilizar|^utilizar (os )?resultados", re.I)):
+            return False
+    except Exception:
+        return False
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            if not REUSE_RE.search(page.inner_text("body")):
+                log(f"  {label}: reaproveitei o resultado que você já tinha na Gupy")
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def fill_test(page, log=console.print, max_questions: int = 30, kind: str = "fit_cultural") -> str:
     """Página do teste já aberta. Devolve 'done' (respondido agora), 'already' (já estava) ou 'failed: motivo'."""
     key = load_key(kind)
@@ -304,6 +328,13 @@ def fill_test(page, log=console.print, max_questions: int = 30, kind: str = "fit
         return "failed: gabarito não encontrado"
     time.sleep(2)
     body = page.inner_text("body")
+    if REUSE_RE.search(body):
+        if not _reuse(page, log, label):
+            _dump(page, "reaproveitar")
+            return "failed: não consegui reaproveitar o resultado anterior"
+        body = page.inner_text("body")
+        if not re.search(r"QUEST[ÃA]O\s+\d+\s+DE", body, re.I):
+            return "done"
     if DONE_RE.search(body):
         return "already"
     intro = 0
@@ -369,6 +400,36 @@ STEP_JS = r"""
   return {found: true, done, hasButton: !!btn};
 }
 """
+
+
+def verify_done(page, url: str, profile: dict, browser, log=console.print, kind: str = "fit_cultural", tries: int = 3):
+    """Confere na página da candidatura (link do e-mail) se a etapa ficou com ✅. True = conferido, False = a etapa
+    aparece sem ✅, None = não deu para conferir (página não carregou / etapa não encontrada)."""
+    from types import SimpleNamespace
+    from .appliers.generic import GupyApplier
+    seen = None
+    for i in range(tries):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            for _ in range(25):
+                time.sleep(1)
+                if re.search(r"signin|login", page.url or "") or page.locator(".expandable-card__header-text").count():
+                    break
+            if re.search(r"signin|login", page.url or ""):
+                if not GupyApplier()._login_via_linkedin(SimpleNamespace(profile=profile, browser=browser), page):
+                    return seen
+                continue
+            time.sleep(2)
+            st = page.evaluate(STEP_JS, TESTS[kind]["step"])
+        except Exception as ex:
+            log(f"  conferência: {type(ex).__name__}: {str(ex)[:80]}")
+            st = {}
+        if st.get("done"):
+            return True
+        if st.get("found"):
+            seen = False
+        time.sleep(10 * (i + 1))   # a Gupy às vezes demora a marcar a etapa como concluída
+    return seen
 
 
 def open_test(page, url: str, profile: dict, browser, log=console.print, kind: str = "fit_cultural") -> str:
@@ -447,7 +508,7 @@ def _open_test(page, url: str, profile: dict, browser, log=console.print, kind: 
     if st.get("found") or clicked:
         # espera SEMPRE depois do clique: o teste pode abrir na mesma aba ou numa nova, e às vezes demora (Alterdata,
         # Keep Simple: a tela do teste chegou depois de o bot desistir)
-        for _ in range(25):
+        for _ in range(45):   # Globalweb (14/11): o teste chegou depois de 25 s
             time.sleep(1)
             if "assessments.gupy.io" in (page.url or ""):
                 return True

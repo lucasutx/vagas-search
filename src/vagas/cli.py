@@ -190,13 +190,18 @@ def _system_chrome(s: Settings) -> Path | None:
 def _login_plain_chrome(s: Settings, sites: list[str]) -> None:
     """Chrome comum, SEM automação, no mesmo perfil do bot. O Indeed recusa o navegador automatizado já no
     e-mail ("Algo deu errado"); aqui a verificação é resolvida por você num navegador normal e o bot herda a sessão."""
+    urls = [LOGIN_SITES[n] for n in sites if n in LOGIN_SITES]
+    console.print(f"Abrindo o Chrome normal (sem automação) com o perfil do bot: {', '.join(sites)}")
+    _plain_chrome_until_closed(s, urls)
+
+
+def _plain_chrome_until_closed(s: Settings, urls: list[str]) -> None:
+    """Abre o Chrome comum no perfil do bot com essas abas e só volta quando a janela fecha (perfil liberado)."""
     import subprocess
     exe = _system_chrome(s)
     if not exe:
         console.print("[red]Google Chrome não encontrado; instale-o ou preencha browser.executable_path.[/]"); raise typer.Exit(1)
     udd = resolve(s.browser.user_data_dir)
-    urls = [LOGIN_SITES[n] for n in sites if n in LOGIN_SITES]
-    console.print(f"Abrindo o Chrome normal (sem automação) com o perfil do bot: {', '.join(sites)}")
     console.print("[bold]Faça login em cada aba e FECHE a janela do Chrome quando terminar.[/]")
     proc = subprocess.Popen([str(exe), f"--user-data-dir={udd}", "--no-first-run", "--no-default-browser-check",
                              "--new-window", *urls])
@@ -215,6 +220,38 @@ def _login_plain_chrome(s: Settings, sites: list[str]) -> None:
         except OSError:
             time.sleep(1)
     console.print("[green]Chrome fechado. Sessões salvas no perfil do bot.[/]")
+
+
+@app.command()
+def entrar(url: str = typer.Option(..., "--url", help="página de login/cadastro"),
+           site: str = typer.Option("", "--site", help="linkedin | indeed | gupy | recrutei | host do site"),
+           religar: bool = typer.Option(False, "--religar", help="religar as candidaturas depois (o painel as pausou)")):
+    """Tela Contas do painel: abre o Chrome comum do bot no login do site e espera você fechar a janela."""
+    s = _settings(); db = _db(s)
+    state = DATA_DIR / "logs" / "login_state.json"
+    def mark(st: str, msg: str):
+        state.write_text(json.dumps({"site": site, "url": url, "state": st, "msg": msg,
+                                     "at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False), encoding="utf-8")
+    try:
+        mark("aberto", "Chrome do bot aberto: faça o login e feche a janela")
+        _plain_chrome_until_closed(s, [url])
+        db.kv_set(f"login_at:{site or url}", datetime.now().isoformat(timespec="seconds"))
+        if site in ("indeed", "linkedin", "gupy") and db.kv_get(f"source_block:{site}"):
+            db.kv_set(f"source_block:{site}", "")   # você acabou de entrar: a fonte sai da pausa e as vagas dela voltam
+            console.print(f"[green]{site} saiu da pausa[/]")
+        mark("ok", "janela fechada, sessão salva no perfil do bot")
+    except BaseException as e:
+        mark("erro", f"{type(e).__name__}: {str(e)[:160]}")
+        raise
+    finally:
+        if religar:
+            from .dashboard import running_tasks, start_task
+            if "run" not in running_tasks():
+                try:
+                    start_task("run", {}, ignore_busy=("login",))
+                    console.print("[green]candidaturas religadas[/]")
+                except Exception as e:
+                    console.print(f"[yellow]não religuei as candidaturas: {e}[/]")
 
 
 @app.command()
@@ -334,6 +371,7 @@ def run(interactive: bool = typer.Option(False, "--interactive", "-i")):
     p = rt.pipeline
     interval = timedelta(minutes=rt.s.limits.discovery_interval_minutes)
     last_error = ""
+    last_processed = None   # vagas tentadas na última volta pela fila (0 = fila parada: não segura a busca)
     inbox_every = rt.s.limits.inbox_interval_minutes
 
     def inbox_tick(with_browser: bool = False):
@@ -368,8 +406,10 @@ def run(interactive: bool = typer.Option(False, "--interactive", "-i")):
             inbox_tick(with_browser=True)
             last = rt.db.kv_get("last_discovery")
             due = not last or datetime.fromisoformat(last) + interval <= datetime.now()
-            # A fila já existente tem prioridade sobre outra varredura completa.
-            if due and not rt.db.queue(limit=1):
+            # A fila já existente tem prioridade sobre outra varredura completa — mas fila que não anda (só vagas de fonte
+            # em pausa, como o Indeed pedindo login, ou de canal no teto) não pode segurar a busca: de 14 a 17/11 cinco
+            # vagas do Indeed paradas na fila travaram a descoberta e o bot ficou 3 dias sem vaga nova.
+            if due and (not rt.db.queue(limit=1) or last_processed == 0):
                 counts = p.discover()
                 n, q = p.prepare_all()
                 console.print(f"[bold]descoberta:[/] {sum(counts.values())} novas · {q} na fila")
@@ -378,6 +418,7 @@ def run(interactive: bool = typer.Option(False, "--interactive", "-i")):
             # erro numa rodada não pode derrubar o bot o dia inteiro: registra, avisa uma vez e tenta de novo
             try:
                 summary = p.process_queue()
+                last_processed = summary.processed
                 last_error = ""
             except Exception as e:
                 msg = f"{type(e).__name__}: {str(e)[:200]}"
@@ -399,7 +440,9 @@ def run(interactive: bool = typer.Option(False, "--interactive", "-i")):
             nxt = min(600, max(60, inbox_every * 60))
             if last:
                 nxt = max(60, min(nxt, int((datetime.fromisoformat(rt.db.kv_get('last_discovery')) + interval - datetime.now()).total_seconds())))
-            console.print(f"[dim]fila vazia; próximo ciclo em {nxt//60} min[/]")
+            waiting = len(rt.db.queue(limit=50))
+            console.print(f"[dim]{'fila vazia' if not waiting else f'nada para enviar agora ({waiting} na fila esperando: fonte em pausa ou teto)'}"
+                          f"; próximo ciclo em {nxt//60} min[/]")
             stopflag.nap(nxt)
     except (KeyboardInterrupt, SystemExit):   # Ctrl+C ou SIGTERM do painel/reinício: encerra limpo, sem traceback no log
         console.print("\n[dim]parando…[/]" if not stopflag.requested() else "")

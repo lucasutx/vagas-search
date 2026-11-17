@@ -198,7 +198,7 @@ class Pipeline:
         counts: dict[str, int] = {}
         max_age = self.s.discovery.max_age_hours
         searches = [x for x in self.s.all_searches() if not only_source or x.source == only_source]
-        console.print(f"[dim]{len(searches)} buscas (24h, remoto)[/]")
+        console.print(f"[dim]{len(searches)} buscas (até {max_age}h)[/]")
         for s in searches:
             if stopflag.requested():   # Parar do painel: não começa outra busca
                 raise stopflag.StopRequested()

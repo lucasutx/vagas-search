@@ -13,6 +13,7 @@ tools/
 # --- pessoal: nunca vai para o GitHub ---
 .venv-*/
 config/settings.yaml
+config/preferencias.yaml
 config/profile.yaml.bak*
 config/*.bak*
 .claude/settings.local.json
